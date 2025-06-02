@@ -64,20 +64,25 @@ if __name__ == '__main__':
 
     logger.info('Start generating bundles with self-correction...')
     self_correction_res = {}
+    max_iter = config.get('self_correction_max_iter', 2)  # Default to 2 if not specified
+    
     for test_id, (topk_session_idx, prompt) in tqdm_with_logger(prompt_generated_bundles.items(), 
                                                                 logger=logger, 
                                                                 desc="Self-correction"):
         message = [{"role": "user", "content": prompt}]
         init_res = chat.create_chat_completion(message)
         message.append({"role": "assistant", "content": init_res})
-        for i in range(3):
+        
+        for i in range(max_iter):
             message.append({"role": "user", "content": prompt_generator.get_Self_correction(i)})
             intent_res = chat.create_chat_completion(message)
             message.append({"role": "assistant", "content": intent_res})
-            # early stop if the bundle is not changed
-            if i == 1 and init_res == intent_res:
+            
+            # Early stop if the bundle is not changed and we've done at least 1 iteration
+            if i >= 1 and init_res == intent_res:
                 logger.debug(f"Early stop for test_id {test_id} at iteration {i}")
                 break
+                
         self_correction_res[test_id] = (topk_session_idx, message)
 
     np.save(f'{temp_path}self_correction_res.npy', self_correction_res, allow_pickle=True)
@@ -89,12 +94,18 @@ if __name__ == '__main__':
                                                                  desc="Parsing results"):
         bundle_str = None
         
-        if len(message) == 6:
-            bundle_str = message[-1]['content'].replace('\n', '')
-        elif len(message) == 8:
-            bundle_str = message[-3]['content'].replace('\n', '')
-        else:
-            logger.warning(f'Unexpected message length {len(message)} for test_id: {test_id}')
+        # More flexible parsing based on actual message structure
+        # The last assistant message should contain the final bundle result
+        for i in range(len(message) - 1, -1, -1):
+            if message[i]['role'] == 'assistant':
+                # Check if this looks like a bundle result (contains 'bundle' and brackets)
+                content = message[i]['content'].replace('\n', '')
+                if 'bundle' in content.lower() and ('{' in content or '[' in content):
+                    bundle_str = content
+                    break
+        
+        if not bundle_str:
+            logger.warning(f'No valid bundle result found for test_id: {test_id}')
             continue
             
         if bundle_str:
@@ -156,11 +167,17 @@ if __name__ == '__main__':
     for test_id, (topk_session_idx, context) in tqdm_with_logger(feedback_res.items(), 
                                                                  logger=logger, 
                                                                  desc="Intent feedback"):
-        if len(context) == 8:  # no feedback
+        # Check if feedback was applied by looking for feedback prompts in the context
+        has_feedback = any("error" in msg.get("content", "").lower() or 
+                          "feedback" in msg.get("content", "").lower() 
+                          for msg in context if msg.get("role") == "user")
+        
+        if not has_feedback:  # no feedback was applied
             intent_context[test_id] = (topk_session_idx, context)
             continue
+            
         append_intent_context = context.copy()
-        append_intent_context.append({"role": "user", "content": "Given the adjusted bundles, regenerate the intents behind each bundle. Each intent should be 3-5 words. IMPORTANT: Your response MUST follow this exact JSON format without any additional text: {'bundle1': 'intent description', 'bundle2': 'intent description', ...} with each bundle key matching your previous response."})
+        append_intent_context.append({"role": "user", "content": prompt_generator.get_Self_correction(2)})  # Use the intent regeneration prompt
         intent_str = chat.create_chat_completion(append_intent_context)
         append_intent_context.append({"role": "assistant", "content": intent_str})
         intent_context[test_id] = (topk_session_idx, append_intent_context)
@@ -170,17 +187,60 @@ if __name__ == '__main__':
 
     intent_related_bundles = {}
     for test_id, (topk_session_idx, context) in intent_context.items():
-        bundle_res = output_parser(context[-3]['content'])
-        intent_res = output_parser(context[-1]['content'], type='intent')
+        # Find the most recent bundle result by looking backwards through messages
+        bundle_content = None
+        intent_content = None
+        
+        # Look for the last assistant messages that contain bundle and intent data
+        for i in range(len(context) - 1, -1, -1):
+            if context[i]['role'] == 'assistant':
+                content = context[i]['content']
+                # Check if this looks like an intent result (after bundle feedback)
+                if intent_content is None and ('intent' in content.lower() or 
+                                             ('{' in content and any(key in content.lower() for key in ['bundle', '1', '2', '3']))):
+                    # Try to parse as intent first
+                    intent_test = output_parser(content, type='intent')
+                    if intent_test['state_code'] == 200:
+                        intent_content = content
+                        continue
+                
+                # Check if this looks like a bundle result  
+                if bundle_content is None and ('bundle' in content.lower() and ('{' in content or '[' in content)):
+                    bundle_test = output_parser(content)
+                    if bundle_test['state_code'] == 200:
+                        bundle_content = content
+                        
+                # Stop if we found both
+                if bundle_content and intent_content:
+                    break
+        
+        # Fallback: use the last two assistant messages if we can't find specific content
+        if not bundle_content or not intent_content:
+            assistant_messages = [msg['content'] for msg in context if msg['role'] == 'assistant']
+            if len(assistant_messages) >= 2:
+                if not bundle_content:
+                    bundle_content = assistant_messages[-2]  # Second to last
+                if not intent_content:
+                    intent_content = assistant_messages[-1]   # Last
+            elif len(assistant_messages) == 1:
+                # Only one message, try to use it for both
+                bundle_content = intent_content = assistant_messages[0]
+        
+        if not bundle_content:
+            logger.warning(f'No bundle content found for test_id: {test_id}')
+            continue
+            
+        bundle_res = output_parser(bundle_content)
+        intent_res = output_parser(intent_content or bundle_content, type='intent')
         items_session = session_items[topk_session_idx].split(',')
         ground_truth_bundles = session_bundles[topk_session_idx]
 
         if bundle_res['state_code'] == 404:
-            logger.warning(f'Error when parsering test_id: {test_id}')
+            logger.warning(f'Error when parsing bundle for test_id: {test_id}')
             continue
         elif bundle_res['state_code'] == 200:
             bundle_dict = bundle_res['output']
-            intent_dict = intent_res['output']
+            intent_dict = intent_res['output'] if intent_res['state_code'] == 200 else {}
             related_bundles = []
             for bundle_id, items in bundle_dict.items():
                 if len(items) < 2:
@@ -324,9 +384,11 @@ if __name__ == '__main__':
             
             for rater in intent_raters:
                 message = [{"role": "user", "content": intent_feedback_generation[test_id]}]
-                # rate for 3 times
+                # Rate based on config parameter
+                rating_repeats = config.get('intent_rating_repeats', 1)  # Default to 1 if not specified
                 scores_res = {}
-                for _ in range(3):
+                
+                for attempt in range(rating_repeats):
                     try:
                         intent_feedback_str = rater.create_chat_completion(message)
                         # Add debugging output
@@ -380,20 +442,33 @@ if __name__ == '__main__':
                                     logger.warning(f"No intent keys found for bundle {bid}")
                             except AttributeError:
                                 logger.warning(f"Invalid intent object for bundle {bid}: {intent}")
-                        
+                                
                     except Exception as e:
-                        logger.error(f"Error during intent rating: {str(e)}")
+                        logger.error(f"Error during intent rating attempt {attempt}: {str(e)}")
                 
                 if scores_res:  # Only append if we have valid scores
                     metric_scores.append(scores_res)
             
             # Only proceed if we have valid metrics
-            if len(metric_scores) < 1:
-                logger.warning(f"No valid metrics for test_id: {test_id}")
-                continue
+            if len(metric_scores) > 0:
+                # Average across all raters and attempts
+                final_scores = {}
+                num_raters = len(metric_scores)
+                rating_repeats = config.get('intent_rating_repeats', 1)
                 
-            # Rest of the processing
-            # ...
+                for scores_dict in metric_scores:
+                    for idx, (score1, score2) in scores_dict.items():
+                        if idx not in final_scores:
+                            final_scores[idx] = [np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 0.0])]
+                        final_scores[idx][0] += score1 / (num_raters * rating_repeats)
+                        final_scores[idx][1] += score2 / (num_raters * rating_repeats)
+                
+                intent_feedback_res[test_id] = (topk_session_idx, related_bundles, final_scores)
+                logger.debug(f"Processed intent feedback for test_id {test_id} with {len(final_scores)} bundles")
+            else:
+                logger.warning(f"No valid metrics for test_id: {test_id}, using original context")
+                # Fallback to original context without feedback
+                intent_feedback_res[test_id] = intent_context[test_id]
             
         except Exception as e:
             logger.error(f"Error processing test_id {test_id}: {str(e)}")
