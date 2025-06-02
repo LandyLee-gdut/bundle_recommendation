@@ -16,63 +16,23 @@ class PromptGenerator(object):
     #         raise ValueError('Invalid prompt type')
 
     def get_Intents_generated_bundles(self, session_info):
-        Init_generated_bundles = """/no-think A bundle can be a set of alternative or complementary products that are purchased with a certain intent.
-            Please detect bundles from a sequence of products. Each bundle must contain multiple products.
+        Init_generated_bundles = """Detect product bundles (2+ items) from: $session_info
 
-            Here are the products and descriptions: $session_info.
-
-            IMPORTANT: Your response MUST follow this exact JSON format without any additional text or explanation:
-            {
-            "bundle1": ["product1", "product2", "product3"],
-            "bundle2": ["product4", "product5"],
-            ...
-            }
-
-            Each bundle key should be in the format 'bundle1', 'bundle2', etc.
-            Each product should be referred to by its product number exactly as shown above.
-            DO NOT include any explanations, comments, or additional text in your response.
-        """
+Output JSON only:
+{"bundle1": ["product1", "product2"], "bundle2": ["product3", "product4"]}"""
 
         return Template(Init_generated_bundles).substitute(session_info=session_info)
 
     def get_Self_correction(self, idx):
         Self_correction = [
-        """/no-think Please generate intents behind the detected bundles using 3 to 5 words for each intent.
-
-IMPORTANT: Your response MUST follow this exact JSON format without any additional text:
-{
-  "bundle1": "intent description here",
-  "bundle2": "intent description here",
-  ...
-}
-
-Each bundle key should be in the format 'bundle1', 'bundle2', etc.
-DO NOT include any explanations, comments, or additional text in your response.""",
+        """Generate intent (3-5 words) for each bundle:
+{"bundle1": "intent here", "bundle2": "intent here"}""",
         
-        """Given the generated intents, adjust the detected bundles with the product descriptions.
-
-IMPORTANT: Your response MUST follow this exact JSON format without any additional text:
-{
-  "bundle1": ["product1", "product2", "product3"],
-  "bundle2": ["product4", "product5"],
-  ...
-}
-
-Each bundle key should be in the format 'bundle1', 'bundle2', etc.
-Each product should be referred to by its product number exactly as shown above.
-DO NOT include any explanations, comments, or additional text in your response.""",
+        """Adjust bundles using intents:
+{"bundle1": ["product1", "product2"], "bundle2": ["product3", "product4"]}""",
         
-        """Given the adjusted bundles, regenerate the intents behind each bundle.
-
-IMPORTANT: Your response MUST follow this exact JSON format without any additional text:
-{
-  "bundle1": "intent description here",
-  "bundle2": "intent description here",
-  ...
-}
-
-Each bundle key should be in the format 'bundle1', 'bundle2', etc.
-DO NOT include any explanations, comments, or additional text in your response."""
+        """Regenerate intents for adjusted bundles:
+{"bundle1": "intent here", "bundle2": "intent here"}"""
     ]
     
         return Self_correction[idx]
@@ -80,98 +40,67 @@ DO NOT include any explanations, comments, or additional text in your response."
     def get_Feedback(self, feedback_type, error_dict=None, intent_feedback=None):
         if feedback_type == 'bundle':
             if not error_dict:
-                return "There are no errors in the bundles."
+                return "No errors found."
                 
             error_types = [
-                "correct.",  # index 0
-                "empty. Please generate non-empty bundles.",  # index 1
-                "not convertible to a dictionary. Please ensure proper format.",  # index 2
-                "of incorrect type. Please use a dictionary format.",  # index 3
-                "invalid. Items should be strings.",  # index 4
-                "containing hallucinated products. Please only use products that are in the session.",  # index 5
-                "not found in ground truth. Please check bundle composition."  # index 6
+                "correct",  # 0
+                "empty - generate non-empty bundles",  # 1
+                "wrong format - use JSON",  # 2
+                "wrong type - use dictionary",  # 3
+                "invalid items - use strings",  # 4
+                "hallucinated products - use session products only",  # 5
+                "not in ground truth"  # 6
             ]
             
-            feed_tips = "/no-think Based on the bundles you provided, I've identified some issues:\n\n"
-            
+            issues = []
             for error in error_dict:
-                # Skip the success code
                 if error == 0:
                     continue
-                    
-                # Make sure error index is within the valid range
                 if 0 <= error < len(error_types):
-                    feed_tips += f"- The bundles {error_dict[error]} are {error_types[error]}\n"
+                    issues.append(f"- {error_dict[error]} are {error_types[error]}")
                 else:
-                    feed_tips += f"- Error code {error}: {error_dict[error]}\n"
+                    issues.append(f"- Error {error}: {error_dict[error]}")
             
-            feed_tips += "\nPlease adjust your bundles accordingly and provide the updated version."
-            return feed_tips
+            return "Issues found:\n" + "\n".join(issues) + "\nAdjust bundles accordingly."
             
         elif feedback_type == 'intent':
             if not intent_feedback:
-                return "There are no issues with the intents."
+                return "No intent issues."
                 
-            intent_type = ['specificity', 'relevance', 'coherence']
-            feed_tips = "/no-think Based on the intents you provided, I've identified some issues:\n\n"
+            intent_types = ['specificity', 'relevance', 'coherence']
+            issues = []
             
             for bundle_id, aspects in intent_feedback.items():
-                feed_tips += f"- For bundle {bundle_id}, please improve the intent in terms of "
-                aspect_improvements = []
-                
+                improvements = []
                 for aspect_id in aspects:
-                    # Ensure aspect_id is within range
-                    if 0 <= aspect_id < len(intent_type):
-                        aspect_improvements.append(intent_type[aspect_id])
+                    if 0 <= aspect_id < len(intent_types):
+                        improvements.append(intent_types[aspect_id])
                     else:
-                        aspect_improvements.append(f"aspect {aspect_id}")
+                        improvements.append(f"aspect{aspect_id}")
                         
-                feed_tips += " and ".join(aspect_improvements) + ".\n"
+                issues.append(f"- {bundle_id}: improve {', '.join(improvements)}")
                 
-            feed_tips += "\nPlease provide updated intents for these bundles."
-            return feed_tips
+            return "Intent issues:\n" + "\n".join(issues) + "\nProvide updated intents."
         
         else:
             return "Unknown feedback type."
 
     def get_Intent_rater(self, related_bundles, item_titles):
-        prompts_template = '''/no-think
-The intent should describe the customer motivation well in the purchase of the product bundles. You are asked to evaluate two intents for a bundle, using three metrics: Naturalness, Coverage, and Motivation. The details and scales of each metric are listed below:
+        prompts_template = '''Rate 2 intents for each bundle on 3 metrics (1-3 scale):
 
-Naturalness:
-1-the intent is difficult to read and understand.
-2-the intent is fair to read and understand.
-3-the intent is easy to read and understand.
+Naturalness: 1=hard to read, 2=fair, 3=easy
+Coverage: 1=few items covered, 2=half, 3=most  
+Motivation: 1=no motivation, 2=has motivation
 
-Coverage:
-1-only a few items in the bundle are covered by the intent.
-2-around half items in the bundle are covered by the intent.
-3-most items in the bundle are covered by the intent.
+Bundles: $bundle_info
 
-Motivation:
-1-the intent contains no motivational description.
-2-the intent contains motivational description.
-
-Following are the bundles that we ask you to evaluate:
-$bundle_info
-
-IMPORTANT: Your response MUST be a valid, complete JSON object - make sure ALL brackets are properly closed. 
-Follow this exact JSON format without ANY additional text or explanations:
+Output JSON only:
 {
   "bundle1": {
-    "intent1": [Naturalness_score, Coverage_score, Motivation_score],
-    "intent2": [Naturalness_score, Coverage_score, Motivation_score]
-  },
-  "bundle2": {
-    "intent1": [Naturalness_score, Coverage_score, Motivation_score],
-    "intent2": [Naturalness_score, Coverage_score, Motivation_score]
+    "intent1": [N_score, C_score, M_score],
+    "intent2": [N_score, C_score, M_score]
   }
-}
-
-The JSON object MUST be properly formatted and closed with a final } bracket.
-Use only numeric values (1, 2, or 3) for scores.
-DO NOT include any explanations, comments, or additional text outside of this JSON structure.
-'''
+}'''
         meta_info = {}
         for test_id, (topk_session_idx, related_infos) in related_bundles.items():
             all_info = []
@@ -197,21 +126,9 @@ DO NOT include any explanations, comments, or additional text outside of this JS
         return intent_rater_prompt
 
     def get_test_prompts(self, data_info):
-        test_prompts = """/no-think Based on the rules, detect bundles for the below product sequence:
+        test_prompts = """Detect bundles from products: $product_info
 
-$product_info
-
-IMPORTANT: Your response MUST follow this exact JSON format without any additional text:
-{
-  "bundle1": ["product1", "product2", "product3"],
-  "bundle2": ["product4", "product5"],
-  ...
-}
-
-Each bundle key should be in the format 'bundle1', 'bundle2', etc.
-Each product should be referred to by its product number exactly as shown above.
-DO NOT include any explanations, comments, or additional text in your response.
-"""
+Output JSON: {"bundle1": ["product1", "product2"]}"""
 
         test_item_titles = {}
         for idx, item_title in enumerate(data_info.split('|')):
